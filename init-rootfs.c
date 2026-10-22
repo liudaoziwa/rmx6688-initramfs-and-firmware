@@ -517,7 +517,7 @@ static void mdinit_launcher(void)
  * and wedge the SoC at boot), so it ships in the initramfs and is loaded here
  * before the modem starts, so the SCP is up for the MD CCISM handshake.
  */
-static void load_kernel_module(const char *path)
+static void load_kernel_module_params(const char *path, const char *params)
 {
 	int fd = open(path, O_RDONLY | O_CLOEXEC);
 
@@ -525,11 +525,16 @@ static void load_kernel_module(const char *path)
 		klogf("%s: not present (%s)", path, strerror(errno));
 		return;
 	}
-	if (syscall(SYS_finit_module, fd, "", 0) != 0)
+	if (syscall(SYS_finit_module, fd, params, 0) != 0)
 		klogf("%s: finit_module failed: %s", path, strerror(errno));
 	else
-		klogf("%s: loaded", path);
+		klogf("%s: loaded '%s'", path, params);
 	close(fd);
+}
+
+static void load_kernel_module(const char *path)
+{
+	load_kernel_module_params(path, "");
 }
 
 static void load_scp_module(void)
@@ -548,6 +553,13 @@ static void load_scp_module(void)
 	load_kernel_module("/lib/modules/ccci_fsm_scp.ko");
 	/* connectivity<->SCP bridge (uses scp.ko's exported symbols) */
 	load_kernel_module("/lib/modules/connscp.ko");
+	/*
+	 * SCP sensorhub liveness probe: registers the vendor sensorhub IPI
+	 * channels and performs the ready handshake (uses scp.ko's exported
+	 * symbols).
+	 */
+	load_kernel_module_params("/lib/modules/sensorhub_probe.ko",
+				  "shm_mask=0x07");
 	/*
 	 * MT6991 GPS data-link driver (vendor v062).  Binds to the
 	 * gps@40c00000 DT node and exposes /dev/stpgps; the built-in
@@ -868,6 +880,94 @@ static void start_kmsg_logger(void)
 	klog("log: real-time kmsg logging started");
 }
 
+/*
+ * Preserve the previous boot's pstore records (console-ramoops above all)
+ * on the log partition before the next reboot overwrites them, and log a
+ * one-line summary per record so a missing panic log is visible in
+ * kernel.log.
+ */
+static void snapshot_pstore(void)
+{
+	char src[256], dst[256], head[160];
+	DIR *d;
+	struct dirent *e;
+	char *buf;
+	int n = 0;
+
+	/*
+	 * /sys/fs/pstore is a kernel-created sysfs mount point
+	 * (sysfs_create_mount_point in fs/pstore/inode.c).  mkdir()
+	 * there always fails with EPERM, even though it exists.
+	 */
+	if (mkdir("/sys/fs/pstore", 0755) != 0 && errno != EEXIST &&
+	    errno != EPERM) {
+		klogf("pstore: mkdir failed (%d)", errno);
+		return;
+	}
+	if (mount("pstore", "/sys/fs/pstore", "pstore", 0, NULL) != 0) {
+		klogf("pstore: mount failed (%d)", errno);
+		return;
+	}
+
+	d = opendir("/sys/fs/pstore");
+	if (!d) {
+		klogf("pstore: opendir failed (%d)", errno);
+		return;
+	}
+	mkdir(LOGMNT_DIR "/pstore", 0755);
+
+	buf = malloc(65536);
+	if (!buf) {
+		closedir(d);
+		return;
+	}
+
+	while ((e = readdir(d))) {
+		size_t total = 0, copy = 0;
+		ssize_t r;
+		int rfd, wfd;
+
+		if (e->d_name[0] == '.')
+			continue;
+
+		snprintf(src, sizeof(src), "/sys/fs/pstore/%s", e->d_name);
+		rfd = open(src, O_RDONLY | O_CLOEXEC);
+		if (rfd < 0)
+			continue;
+
+		head[0] = 0;
+		snprintf(dst, sizeof(dst), LOGMNT_DIR "/pstore/%s", e->d_name);
+		wfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+		while ((r = read(rfd, buf, 65536)) > 0) {
+			size_t i, j = 0;
+
+			total += r;
+			if (wfd >= 0 && copy < 8 * 1024 * 1024) {
+				write(wfd, buf, r);
+				copy += r;
+			}
+			if (head[0])
+				continue;
+			for (i = 0; i < (size_t)r && buf[i] != '\n'; i++)
+				if (j < sizeof(head) - 1)
+					head[j++] = (buf[i] >= 32 && buf[i] < 127) ?
+						    buf[i] : ' ';
+			head[j] = 0;
+		}
+		close(rfd);
+		if (wfd >= 0) {
+			fsync(wfd);
+			close(wfd);
+		}
+		klogf("pstore: %s %zu bytes%s%s", e->d_name, total,
+		      head[0] ? " first: " : "", head);
+		n++;
+	}
+	free(buf);
+	closedir(d);
+	klogf("pstore: %d file(s) found", n);
+}
+
 int main(void)
 {
 	struct utsname u;
@@ -961,6 +1061,9 @@ int main(void)
 
 	/* real-time kernel log to the ext4 log partition (survives a panic) */
 	start_kmsg_logger();
+
+	/* keep the previous boot's panic records around */
+	snapshot_pstore();
 
 	/* bring up the SCP (module) before the modem needs the CCISM peer */
 	load_scp_module();
