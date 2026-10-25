@@ -341,6 +341,27 @@ static int mount_newroot(const char *dev)
 	return 0;
 }
 
+static void preserve_initramfs_firmware(void)
+{
+	if (mkdir("/newroot/lib", 0755) != 0 && errno != EEXIST) {
+		klogf("firmware: mkdir /newroot/lib failed: %s",
+		      strerror(errno));
+		return;
+	}
+	if (mkdir("/newroot/lib/firmware", 0755) != 0 && errno != EEXIST) {
+		klogf("firmware: mkdir /newroot/lib/firmware failed: %s",
+		      strerror(errno));
+		return;
+	}
+	if (mount("/lib/firmware", "/newroot/lib/firmware", NULL,
+		  MS_BIND | MS_REC, NULL) != 0) {
+		klogf("firmware: bind /lib/firmware failed: %s",
+		      strerror(errno));
+		return;
+	}
+	klog("firmware: bound initramfs /lib/firmware into new root");
+}
+
 static void switch_root_to(const char *dev)
 {
 	const char *init;
@@ -350,6 +371,8 @@ static void switch_root_to(const char *dev)
 	init = rootfs_pick_init();
 	if (!init)
 		return;
+
+	preserve_initramfs_firmware();
 
 	/*
 	 * The initramfs is discarded by the switch_root below, so keep the
