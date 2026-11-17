@@ -1020,6 +1020,25 @@ int main(void)
 		}
 	}
 
+	/*
+	 * The bootloader passes ignore_loglevel, so the WiFi PCIe RX-polling
+	 * dumps and CCCI info lines (~70/s) go out the 115200 ttyS0 console;
+	 * the nbcon thread then spins in UART writes for ~14% of a CPU and
+	 * printk console locking adds visible input/compositor latency.
+	 * dmesg keeps recording everything, but warnings/errors only hit the
+	 * serial console from now on.
+	 */
+	{
+		int fd = open("/sys/module/printk/parameters/ignore_loglevel",
+			      O_WRONLY | O_CLOEXEC);
+
+		if (fd >= 0) {
+			if (write(fd, "N", 1) >= 0)
+				klog("printk: ignore_loglevel disabled");
+			close(fd);
+		}
+	}
+
 	klog("=== MT6991 rootfs boot init ===");
 	if (uname(&u) == 0)
 		klogf("running %s %s (%s)", u.sysname, u.release, u.machine);
